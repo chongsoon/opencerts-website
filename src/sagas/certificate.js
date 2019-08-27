@@ -1,16 +1,9 @@
-import {
-  some,
-  get,
-  partition,
-  compact,
-  filter,
-  isEmpty,
-  mapKeys
-} from "lodash";
+import { some, get, partition, compact, mapKeys } from "lodash";
 import { put, all, call, select, takeEvery } from "redux-saga/effects";
-import { certificateData, verifySignature } from "@govtechsg/open-certificate";
+import { getData, verifySignature } from "@govtechsg/open-attestation";
 import { isValidAddress as isEthereumAddress } from "ethereumjs-util";
 import Router from "next/router";
+import { getDocumentStoreRecords } from "@govtechsg/dnsprove";
 import { getLogger } from "../utils/logger";
 import {
   types,
@@ -22,6 +15,8 @@ import {
   verifyingCertificateIssuedFailure,
   verifyingCertificateHashSuccess,
   verifyingCertificateHashFailure,
+  verifyingCertificateStoreSuccess,
+  verifyingCertificateStoreFailure,
   getCertificate
 } from "../reducers/certificate";
 import { types as applicationTypes } from "../reducers/application";
@@ -33,6 +28,7 @@ import sendEmail from "../services/email";
 import { analyticsEvent } from "../components/Analytics";
 
 import { getSelectedWeb3 } from "./application";
+import { IS_MAINNET } from "../config";
 
 const { trace, error } = getLogger("saga:certificate");
 
@@ -40,15 +36,20 @@ const ANALYTICS_VERIFICATION_ERROR_CODE = {
   ISSUER_IDENTITY: 0,
   CERTIFICATE_HASH: 1,
   UNISSUED_CERTIFICATE: 2,
-  REVOKED_CERTIFICATE: 3
+  REVOKED_CERTIFICATE: 3,
+  CERTIFICATE_STORE: 4
 };
+
+function getDocumentStore(issuer) {
+  return issuer.certificateStore || issuer.documentStore;
+}
 
 export function* loadCertificateContracts({ payload }) {
   try {
-    const data = certificateData(payload);
+    const data = getData(payload);
     trace(`Loading certificate: ${data}`);
     const unresolvedContractStoreAddresses = get(data, "issuers", []).map(
-      issuer => issuer.certificateStore
+      issuer => getDocumentStore(issuer)
     );
     const web3 = yield getSelectedWeb3();
     const contractStoreAddresses = yield all(
@@ -77,8 +78,76 @@ export function* loadCertificateContracts({ payload }) {
   }
 }
 
+export function* isValidENSDomain(storeAddress) {
+  trace(`Checking if ${storeAddress} is a valid ENS Domain`);
+  if (storeAddress == null) {
+    throw new Error("No address in certificate");
+  }
+  const web3 = yield getSelectedWeb3();
+  const ensToAddress = yield web3.eth.ens.getAddress(storeAddress);
+  if (ensToAddress === null) {
+    throw new Error("Invalid ENS");
+  }
+  return ensToAddress;
+}
+
+export function* isValidSmartContract(storeAddress) {
+  const web3 = yield getSelectedWeb3();
+  const supportedContractHashes = [
+    "0x7135575eac76f1817c27b06c452bdc2b7e1b13240797415684e227def063a127"
+  ];
+  const onChainByteCode = yield web3.eth.getCode(storeAddress);
+  const hashOfOnChainByteCode = web3.utils.keccak256(onChainByteCode);
+  if (!supportedContractHashes.includes(hashOfOnChainByteCode)) {
+    throw new Error("Invalid smart contract: "`${storeAddress}`);
+  }
+  return true;
+}
+
+export function* verifyCertificateStore({ certificate }) {
+  try {
+    const data = getData(certificate);
+
+    const contractStoreAddresses = get(data, "issuers", []).map(issuer =>
+      getDocumentStore(issuer)
+    );
+    trace(`Attempting to verify certificate store: ${contractStoreAddresses}`);
+
+    const [ethereumAddressIssuers, unresolvedEnsNames] = partition(
+      contractStoreAddresses,
+      isEthereumAddress
+    );
+    trace("ethereumAddressIssuers", ethereumAddressIssuers);
+    trace("unresolvedEnsNames", unresolvedEnsNames);
+
+    const resolvedEnsNames = yield unresolvedEnsNames.map(unresolvedEnsName =>
+      call(isValidENSDomain, unresolvedEnsName)
+    );
+
+    // Concat the 2 arrays
+    const combinedStoreAddresses = compact(
+      ethereumAddressIssuers.concat(resolvedEnsNames)
+    );
+
+    // Checks if issuing institution has a valid smart contract with OpenCerts
+    yield combinedStoreAddresses.map(address => isValidSmartContract(address));
+    yield put(verifyingCertificateStoreSuccess());
+    return combinedStoreAddresses;
+  } catch (e) {
+    error(e);
+    yield put(
+      verifyingCertificateStoreFailure({
+        error: e.message,
+        certificate: getData(certificate)
+      })
+    );
+    return false;
+  }
+}
+
 export function* verifyCertificateHash({ certificate }) {
   const verified = verifySignature(certificate);
+
   if (verified) {
     yield put(verifyingCertificateHashSuccess());
     return true;
@@ -86,7 +155,7 @@ export function* verifyCertificateHash({ certificate }) {
   yield put(
     verifyingCertificateHashFailure({
       error: "Certificate data does not match target hash",
-      certificate: certificateData(certificate)
+      certificate: getData(certificate)
     })
   );
   return false;
@@ -100,6 +169,7 @@ export function* verifyCertificateIssued({ certificate, certificateStores }) {
     const issuedStatuses = yield all(
       certificateStores.map(store => store.methods.isIssued(merkleRoot).call())
     );
+    if (issuedStatuses.length === 0) throw new Error("Invalid file");
     const isIssued = issuedStatuses.reduce((prev, curr) => prev && curr, true);
     if (!isIssued) throw new Error("Certificate has not been issued");
     yield put(verifyingCertificateIssuedSuccess());
@@ -107,7 +177,7 @@ export function* verifyCertificateIssued({ certificate, certificateStores }) {
   } catch (e) {
     yield put(
       verifyingCertificateIssuedFailure({
-        certificate: certificateData(certificate),
+        certificate: getData(certificate),
         error: e.message
       })
     );
@@ -159,7 +229,7 @@ export function* verifyCertificateNotRevoked({
   } catch (e) {
     yield put(
       verifyingCertificateRevocationFailure({
-        certificate: certificateData(certificate),
+        certificate: getData(certificate),
         error: e.message
       })
     );
@@ -177,94 +247,144 @@ function isApprovedENSDomain(issuerAddress) {
   );
 }
 
-export function* lookupEthereumAddresses(ethereumAddressIssuers) {
+export function* lookupAddressOnRegistry(ethereumAddressIssuer) {
   const registeredIssuers = yield fetchIssuers();
   const issuersNormalised = mapKeys(registeredIssuers, (_, k) =>
     k.toUpperCase()
   );
 
-  return ethereumAddressIssuers.map(store => {
-    const identity = issuersNormalised[store.toUpperCase()];
-
-    if (!identity) {
-      throw new Error(`Issuer identity cannot be verified: ${store}`);
-    }
-
-    return identity;
-  });
+  const identity = issuersNormalised[ethereumAddressIssuer.toUpperCase()];
+  if (!identity) {
+    throw new Error(
+      `Issuer identity cannot be verified: ${ethereumAddressIssuer}`
+    );
+  }
+  return identity;
 }
 
-export function* resolveEnsNamesToText(ensNames) {
-  trace("resolving ", ensNames);
-  if (some(ensNames.map(ensName => !isApprovedENSDomain(ensName)))) {
-    const invalidEns = filter(ensNames, !isApprovedENSDomain);
-
+export function* resolveEnsNameToText(ensName) {
+  trace("resolving ", ensName);
+  if (!isApprovedENSDomain(ensName)) {
     const invalidEnsError = new Error(
-      `Issuer identity cannot be verified: ${invalidEns}`
+      `Issuer identity cannot be verified: ${ensName}`
     );
     error(invalidEnsError);
     throw invalidEnsError;
   }
 
-  const getTextResults = yield all(
-    ensNames.map(ensName => call(getText, ensName, "issuerName"))
-  );
-  trace(`Got texts records for ${ensNames}`, getTextResults);
-  trace(getTextResults);
-  return getTextResults;
+  const getTextResult = yield call(getText, ensName, "issuerName");
+  trace(`Got texts records for ${ensName}`, getTextResult);
+  return getTextResult;
 }
 
-export function* verifyCertificateIssuer({ certificate }) {
-  try {
-    const data = certificateData(certificate);
-    const contractStoreAddresses = get(data, "issuers", []).map(
-      issuer => issuer.certificateStore
+export function* verifyCertificateDnsIssuer({ issuer }) {
+  const location = get(issuer, "identityProof.location");
+
+  if (!location) return false;
+
+  const dnsRecords = yield call(getDocumentStoreRecords, location);
+
+  trace(`DNS records: ${JSON.stringify(dnsRecords)}`); // dnsRecords: [{addr: "0xabc", netId: 3}]
+  let verificationStatus = false;
+  const documentStore = getDocumentStore(issuer);
+  if (dnsRecords && dnsRecords.length > 0) {
+    verificationStatus = dnsRecords.find(
+      dns =>
+        dns.addr === documentStore && dns.netId === (IS_MAINNET ? "1" : "3")
     );
+  }
+  trace(`DNS Verification Status: ${JSON.stringify(verificationStatus)}`);
+  return verificationStatus ? location : false;
+}
+
+export function* verifyCertificateRegistryIssuer({ issuer }) {
+  try {
+    const contractStoreAddresses = getDocumentStore(issuer);
     trace(
       `Attempting to verify certificate issuers: ${contractStoreAddresses}`
     );
+    const isValidEthereumAddress = isEthereumAddress(contractStoreAddresses);
 
-    const [ethereumAddressIssuers, unresolvedEnsNames] = partition(
-      contractStoreAddresses,
-      isEthereumAddress
-    );
-
-    let resolvedEnsTexts = [];
-    let issuerIdentitiesFromRegistry = [];
-
-    trace("ethereumAddressIssuers", ethereumAddressIssuers);
-    trace("unresolvedEnsNames", unresolvedEnsNames);
-    if (!isEmpty(compact(unresolvedEnsNames))) {
-      resolvedEnsTexts = yield call(resolveEnsNamesToText, unresolvedEnsNames);
-      trace(`Resolved ens name ${unresolvedEnsNames} to ${resolvedEnsTexts}`);
-    }
-    if (!isEmpty(compact(ethereumAddressIssuers))) {
-      issuerIdentitiesFromRegistry = yield call(
-        lookupEthereumAddresses,
-        ethereumAddressIssuers
-      );
-      trace(
-        `Resolved ethereum address ${ethereumAddressIssuers} to ${issuerIdentitiesFromRegistry}`
+    if (!isValidEthereumAddress) {
+      throw new Error(
+        `${contractStoreAddresses} is not a valid Ethereum Address`
       );
     }
 
-    const combinedIssuerIdentities = compact(
-      issuerIdentitiesFromRegistry.concat(resolvedEnsTexts)
+    trace("isValidEthereumAddress", contractStoreAddresses);
+
+    const issuerIdentitiesFromRegistry = yield call(
+      lookupAddressOnRegistry,
+      contractStoreAddresses
     );
-
-    if (combinedIssuerIdentities.length === 0) {
-      throw new Error(`Issuer identity missing in certificate`);
-    }
-
-    trace("combinedIssuerIdentities", combinedIssuerIdentities);
-    yield put(verifyingCertificateIssuerSuccess(combinedIssuerIdentities));
-    return combinedIssuerIdentities;
+    trace(
+      `Resolved ethereum address ${contractStoreAddresses} to ${issuerIdentitiesFromRegistry}`
+    );
+    return get(issuerIdentitiesFromRegistry, "name") || false;
   } catch (e) {
-    error(e);
+    return false;
+  }
+}
+
+function throwIfAnyIdentityIsNotVerified(verificationStatuses) {
+  if (verificationStatuses.length === 0)
+    throw new Error("No issuers found in the document");
+  const invalidIdentities = verificationStatuses.filter(
+    status => !status.registry && !status.dns
+  );
+  if (invalidIdentities.length > 0) {
+    const invalidStoreAddresses = invalidIdentities.map(
+      identity => identity.documentStore
+    );
+    throw new Error(
+      `Issuer identity cannot be verified: ${invalidStoreAddresses.join(", ")}`
+    );
+  }
+}
+
+export function* getDetailedIssuerStatus({ issuer }) {
+  const verificationStatus = {
+    documentStore: getDocumentStore(issuer),
+    registry: null,
+    dns: null
+  };
+
+  verificationStatus.registry = yield call(verifyCertificateRegistryIssuer, {
+    issuer
+  });
+
+  if (get(issuer, "identityProof.type") === "DNS-TXT") {
+    verificationStatus.dns = yield call(verifyCertificateDnsIssuer, {
+      issuer
+    });
+  }
+  trace(`issuer status: ${JSON.stringify(verificationStatus)}`);
+  return verificationStatus;
+}
+
+export function* verifyCertificateIssuer({ certificate }) {
+  const data = getData(certificate);
+  try {
+    const issuers = get(data, "issuers", []);
+    // verificationStatuses: [{dns: "abc.com", registry:"Govtech", documentStore: "0xabc"}]
+    const verificationStatuses = yield all(
+      issuers.map(issuer => call(getDetailedIssuerStatus, { issuer }))
+    );
+
+    // If any identity is not verified, this should return false
+    throwIfAnyIdentityIsNotVerified(verificationStatuses);
+
+    yield put(
+      verifyingCertificateIssuerSuccess({
+        issuerIdentities: verificationStatuses
+      })
+    );
+    return true;
+  } catch (e) {
     yield put(
       verifyingCertificateIssuerFailure({
         error: e.message,
-        certificate: certificateData(certificate)
+        certificate: data
       })
     );
     return false;
@@ -281,13 +401,16 @@ export function* verifyCertificate({ payload }) {
     certificateIssued: call(verifyCertificateIssued, args),
     certificateHashValid: call(verifyCertificateHash, args),
     certificateNotRevoked: call(verifyCertificateNotRevoked, args),
-    certificateIssuerRecognised: call(verifyCertificateIssuer, args)
+    certificateIssuerRecognised: call(verifyCertificateIssuer, args),
+    certificateStoreValid: call(verifyCertificateStore, args)
   });
   trace(verificationStatuses);
   const verified =
     verificationStatuses.certificateIssued &&
     verificationStatuses.certificateHashValid &&
-    verificationStatuses.certificateNotRevoked;
+    verificationStatuses.certificateNotRevoked &&
+    verificationStatuses.certificateIssuerRecognised &&
+    verificationStatuses.certificateStoreValid;
   if (verified) {
     Router.push("/viewer");
   }
@@ -324,10 +447,16 @@ export function* networkReset() {
   });
 }
 
+export function getAnalyticsStores(certificate) {
+  return get(certificate, "issuers", [])
+    .map(issuer => getDocumentStore(issuer))
+    .toString();
+}
+
 export function* analyticsIssuerFail({ certificate }) {
   yield analyticsEvent(window, {
     category: "CERTIFICATE_ERROR",
-    action: get(certificate, "issuers[0].certificateStore"),
+    action: getAnalyticsStores(certificate),
     label: get(certificate, "id"),
     value: ANALYTICS_VERIFICATION_ERROR_CODE.ISSUER_IDENTITY
   });
@@ -336,7 +465,7 @@ export function* analyticsIssuerFail({ certificate }) {
 export function* analyticsHashFail({ certificate }) {
   yield analyticsEvent(window, {
     category: "CERTIFICATE_ERROR",
-    action: get(certificate, "issuers[0].certificateStore"),
+    action: getAnalyticsStores(certificate),
     label: get(certificate, "id"),
     value: ANALYTICS_VERIFICATION_ERROR_CODE.CERTIFICATE_HASH
   });
@@ -345,7 +474,7 @@ export function* analyticsHashFail({ certificate }) {
 export function* analyticsIssuedFail({ certificate }) {
   yield analyticsEvent(window, {
     category: "CERTIFICATE_ERROR",
-    action: get(certificate, "issuers[0].certificateStore"),
+    action: getAnalyticsStores(certificate),
     label: get(certificate, "id"),
     value: ANALYTICS_VERIFICATION_ERROR_CODE.UNISSUED_CERTIFICATE
   });
@@ -354,9 +483,18 @@ export function* analyticsIssuedFail({ certificate }) {
 export function* analyticsRevocationFail({ certificate }) {
   yield analyticsEvent(window, {
     category: "CERTIFICATE_ERROR",
-    action: get(certificate, "issuers[0].certificateStore"),
+    action: getAnalyticsStores(certificate),
     label: get(certificate, "id"),
     value: ANALYTICS_VERIFICATION_ERROR_CODE.REVOKED_CERTIFICATE
+  });
+}
+
+export function* analyticsStoreFail({ certificate }) {
+  yield analyticsEvent(window, {
+    category: "CERTIFICATE_ERROR",
+    action: getAnalyticsStores(certificate),
+    label: get(certificate, "id"),
+    value: ANALYTICS_VERIFICATION_ERROR_CODE.CERTIFICATE_STORE
   });
 }
 
@@ -371,5 +509,6 @@ export default [
     analyticsRevocationFail
   ),
   takeEvery(types.VERIFYING_CERTIFICATE_ISSUED_FAILURE, analyticsIssuedFail),
-  takeEvery(types.VERIFYING_CERTIFICATE_HASH_FAILURE, analyticsHashFail)
+  takeEvery(types.VERIFYING_CERTIFICATE_HASH_FAILURE, analyticsHashFail),
+  takeEvery(types.VERIFYING_CERTIFICATE_STORE_FAILURE, analyticsStoreFail)
 ];
